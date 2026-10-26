@@ -1,0 +1,21 @@
+diff --git a/src/game/Objects/Player.cpp b/src/game/Objects/Player.cpp
+index dbca56e5..528e5802 100644
+--- a/src/game/Objects/Player.cpp
++++ b/src/game/Objects/Player.cpp
+@@ -19501,7 +19501,16 @@ void Player::AddSpellMod(SpellModifier* mod, bool apply)
+     SendSpellMod(mod);
+ 
+     if (!apply)
++    {
++        // A spell keeps raw pointers to the mods it applied. Drop this one before it is freed, or a
++        // script reading Spell::m_appliedMods in OnFinish (spell_druid_healing_touch) hits freed memory
++        // when the buff ends during a cast-time spell.
++        for (uint8 slot = 0; slot < CURRENT_MAX_SPELL; ++slot)
++            if (Spell* spell = GetCurrentSpell(CurrentSpellTypes(slot)))
++                spell->m_appliedMods.remove(mod);
++
+         delete mod;
++    }
+ }
+ 
+ void Player::SendSpellMod(SpellModifier const* mod) const

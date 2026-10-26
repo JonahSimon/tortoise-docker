@@ -79,10 +79,14 @@ set_conf "${ETC}/mangosd.conf" "BindIP" "\"${BIND_IP}\""
 set_conf "${ETC}/mangosd.conf" "RealmID" "${REALM_ID}"
 set_conf "${ETC}/mangosd.conf" "LogSQL" "${LOG_SQL}"
 set_conf "${ETC}/mangosd.conf" "Database.AutoUpdate.Enabled" "${AUTO_UPDATE}"
-set_conf "${ETC}/mangosd.conf" "Database.AutoUpdate.Path" "\"${SQL_DIR}/\""
+set_conf "${ETC}/mangosd.conf" "Database.AutoUpdate.Path" "\"${SQL_DIR}/database_updates/\""
 set_conf "${ETC}/mangosd.conf" "LFT.BotFill.Enable" "${LFT_BOTFILL}"
 set_conf "${ETC}/mangosd.conf" "SoloDungeonRepopAlive.Enable" "${SOLO_DUNGEON_REPOP}"
 set_conf "${ETC}/mangosd.conf" "Leech.Enable" "${LEECH_ENABLE}"
+# Realm type (0 normal, 1 PvP, 6 RP, 8 RP-PvP). Unset keeps the shipped default, which is 6 (RP).
+if [[ -n "${GAME_TYPE:-}" ]]; then
+  set_conf "${ETC}/mangosd.conf" "GameType" "${GAME_TYPE}"
+fi
 
 # realmd (note: key name has no dots between LoginDatabase and Info)
 set_conf "${ETC}/realmd.conf" "LoginDatabaseInfo" "\"$(DB_INFO "${DB_LOGIN}")\""
@@ -93,7 +97,55 @@ if [[ -f "${ETC}/aiplayerbot.conf" ]]; then
   set_conf "${ETC}/aiplayerbot.conf" "AiPlayerbot.Enabled" "${AI_PLAYERBOT_ENABLED}"
   set_conf "${ETC}/aiplayerbot.conf" "AiPlayerbot.MinRandomBots" "${AI_MIN_RANDOM_BOTS}"
   set_conf "${ETC}/aiplayerbot.conf" "AiPlayerbot.MaxRandomBots" "${AI_MAX_RANDOM_BOTS}"
+
+  # Ported custom features (F1 populate-around-players, F2 travel parties). Only written when
+  # the env var is set, so an unset var leaves the shipped default (off) alone. Values are
+  # passed through verbatim - quote coordinate strings in the environment, e.g.
+  # AI_TRAVEL_PARTY_DEST='"1,-844.0,-2037.0,80.5"'.
+  set_conf_if_set() {
+    local key="$1" value="$2"
+    if [[ -n "${value}" ]]; then
+      set_conf "${ETC}/aiplayerbot.conf" "${key}" "${value}"
+    fi
+  }
+  set_conf_if_set "AiPlayerbot.PopulateAroundPlayers" "${AI_POPULATE_AROUND_PLAYERS:-}"
+  set_conf_if_set "AiPlayerbot.TravelParties" "${AI_TRAVEL_PARTIES:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyTestMode" "${AI_TRAVEL_PARTY_TEST_MODE:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyMuster" "${AI_TRAVEL_PARTY_MUSTER:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyDest" "${AI_TRAVEL_PARTY_DEST:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyLevels" "${AI_TRAVEL_PARTY_LEVELS:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyMoveMode" "${AI_TRAVEL_PARTY_MOVE_MODE:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyLeaderStrip" "${AI_TRAVEL_PARTY_LEADER_STRIP:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyArriveZ" "${AI_TRAVEL_PARTY_ARRIVE_Z:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyLowLevelMaxRoute" "${AI_TRAVEL_PARTY_LOW_LEVEL_MAX_ROUTE:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyLowLevelBand" "${AI_TRAVEL_PARTY_LOW_LEVEL_BAND:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyRequirePlayerZone" "${AI_TRAVEL_PARTY_REQUIRE_PLAYER_ZONE:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyClosestTownPct" "${AI_TRAVEL_PARTY_CLOSEST_TOWN_PCT:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyRaidPct" "${AI_TRAVEL_PARTY_RAID_PCT:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyCrossMapProbe" "${AI_TRAVEL_PARTY_CROSS_MAP_PROBE:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyUseRegistry" "${AI_TRAVEL_PARTY_USE_REGISTRY:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyMaxConcurrent" "${AI_TRAVEL_PARTY_MAX_CONCURRENT:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyMaxDeaths" "${AI_TRAVEL_PARTY_MAX_DEATHS:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartyEnterInstance" "${AI_TRAVEL_PARTY_ENTER_INSTANCE:-}"
+  set_conf_if_set "AiPlayerbot.TravelPartySpawnInterval" "${AI_TRAVEL_PARTY_SPAWN_INTERVAL:-}"
+  set_conf_if_set "AiPlayerbot.PopulateDensityDefault" "${AI_POPULATE_DENSITY_DEFAULT:-}"
+  set_conf_if_set "AiPlayerbot.PopulateDensityOverrides" "${AI_POPULATE_DENSITY_OVERRIDES:-}"
+  set_conf_if_set "AiPlayerbot.PopulateProbTeleport" "${AI_POPULATE_PROB_TELEPORT:-}"
+  set_conf_if_set "AiPlayerbot.PopulatePeerAnyLevelPoints" "${AI_POPULATE_PEER_ANY_LEVEL_POINTS:-}"
+  set_conf_if_set "AiPlayerbot.RandomBotForcePvp" "${AI_RANDOM_BOT_FORCE_PVP:-}"
+  set_conf_if_set "AiPlayerbot.WorldPvpSeek" "${AI_WORLD_PVP_SEEK:-}"
+set_conf_if_set "AiPlayerbot.WorldPvpSeekBotPercent" "${AI_WORLD_PVP_SEEK_BOT_PERCENT:-}"
 fi
+
+# Local pins: conf-overrides/<name>.conf holds "Key = Value" lines applied on top of the rendered
+# <name>.conf, so values we chose survive a new image whose .dist defaults changed.
+for o in /opt/turtle/conf-overrides/*.conf; do
+  [[ -f "${o}" && -f "${ETC}/$(basename "${o}")" ]] || continue
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" =~ ^[[:space:]]*([A-Za-z0-9_.]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]] || continue
+    set_conf "${ETC}/$(basename "${o}")" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  done < "${o}"
+done
 
 mkdir -p "${LOGS_DIR}"
 # Writable for the turtle user (configs may be regenerated each start).

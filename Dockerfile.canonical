@@ -1,0 +1,208 @@
+# syntax=docker/dockerfile:1.7
+# Tortoise WoW, canonical core (tortoise-wow/tortoise-wow main) + TortoiseBots module (our fork
+# JonahSimon/TortoiseBots, branch custom/main, on top of Sagiroth/TortoiseBots),
+# both pinned by commit. Ubuntu 22.04. Bots are the TortoiseBots module (MODULES=static); the old
+# Shyalya-fork Dockerfile is kept beside this one as Dockerfile for rollback builds.
+
+ARG UBUNTU_VERSION=22.04
+
+# -----------------------------------------------------------------------------
+# Builder
+# -----------------------------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION} AS builder
+
+# BUILD_PLAYERBOTS only feeds PLAYERBOTS_BUILT for init-db.sh, which must skip the old Shyalya
+# playerbots SQL; TortoiseBots ships its own migrations through the core AutoUpdater.
+ARG BUILD_PLAYERBOTS=OFF
+ARG USE_EXTRACTORS=OFF
+ARG CMAKE_BUILD_TYPE=Release
+ARG CMAKE_INSTALL_PREFIX=/opt/turtle
+ARG BUILD_JOBS=2
+ARG CPU_TARGET=x86-64-v2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        ccache \
+        cmake \
+        git \
+        libace-dev \
+        libboost-all-dev \
+        default-libmysqlclient-dev \
+        libssl-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        pkg-config \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# CACHEBUST forces a fresh clone on demand (pass --build-arg CACHEBUST=$(date +%s)) without
+# needing `docker build --no-cache`, which would also wipe the ccache mount below - the two
+# problems (stale git checkout vs. slow full recompiles) need separate cache-invalidation
+# knobs, not the same sledgehammer.
+ARG CACHEBUST=1
+# Source pins sit here, below apt-get: an ARG declared earlier is part of every later RUN's
+# cache key, so each new pin re-ran the apt layer.
+ARG SOURCE_REPO=https://github.com/tortoise-wow/tortoise-wow.git
+ARG SOURCE_REF=d94947b0db60c33e7248523ad0ba7f58af97fd09
+ARG TB_REPO=https://github.com/JonahSimon/TortoiseBots.git
+ARG TB_REF=5b8959c0f86ef06085016c84dc24b5e9aa30309a
+# Shallow fetch of an exact commit (git clone --branch cannot take a sha).
+RUN git init -q tortoise-wow \
+    && git -C tortoise-wow fetch -q --depth 1 "${SOURCE_REPO}" "${SOURCE_REF}" \
+    && git -C tortoise-wow checkout -q FETCH_HEAD \
+    && if [ -f tortoise-wow/.gitmodules ]; then git -C tortoise-wow submodule update --init --depth 1; fi \
+    && git init -q tortoise-wow/modules/TortoiseBots \
+    && git -C tortoise-wow/modules/TortoiseBots fetch -q --depth 1 "${TB_REPO}" "${TB_REF}" \
+    && git -C tortoise-wow/modules/TortoiseBots checkout -q FETCH_HEAD
+
+WORKDIR /src/tortoise-wow
+
+# Local fixes to the pinned canonical core (one .patch per fix, see patches/).
+COPY patches /patches
+RUN for p in /patches/*.patch; do git apply --verbose "$p"; done
+
+ARG EXTRACTORS_ONLY=OFF
+
+# TortoiseBots' own gate: fails the build early if the core no longer exposes the generic
+# headless/session/module seams the module calls.
+RUN bash modules/TortoiseBots/tools/verify_penqle_host_contract.sh --core .
+
+# The upstream build currently adds -march=native. That makes a published
+# image depend on the CPU that built it and can emit instructions unavailable
+# on otherwise supported hosts. Keep the image portable across x86-64 CPUs.
+RUN if grep -q -- '-march=native' CMakeLists.txt; then \
+        sed -i "s/-march=native/-march=${CPU_TARGET}/g" CMakeLists.txt; \
+    fi \
+    && if grep -q -- '-march=native' CMakeLists.txt; then \
+         echo "CMakeLists.txt still contains -march=native" >&2; \
+         exit 1; \
+       fi
+
+# CCACHE_DIR is a BuildKit cache mount: it survives `docker build --no-cache`, which only
+# busts the layer cache (needed to actually pick up new commits from a moving branch) and
+# says nothing about ccache's own content-hash cache. Rebuilding after a small source change
+# should only recompile the translation units that actually changed.
+# CCACHE_SLOPPINESS: this tree builds with precompiled headers (src/modules/PlayerBots
+# botpch.h, core pchdef.h). Without pch_defines+time_macros ccache refuses to cache any
+# PCH-using compile - the first real build measured 139 cacheable vs 1016 UNCACHEABLE
+# objects, i.e. the cache was near-useless. Measured again by the `ccache -s -v` below.
+ENV CCACHE_DIR=/ccache \
+    CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime
+# -DENABLE_SOAP=OFF: Shyalya's final tree vendors a prebuilt libgsoap++.a linked against glibc 2.38+, and
+# this image is 22.04 (glibc 2.35), so it cannot link. We do not use SOAP (the console is the FIFO).
+# Older source trees ignore the flag.
+RUN --mount=type=cache,target=/ccache \
+    cmake -B build \
+        -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+        -DCMAKE_INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}" \
+        -DMODULES=static \
+        -DMODULE_TORTOISEBOTS=static \
+        -DUSE_EXTRACTORS="${USE_EXTRACTORS}" \
+        -DALLOW_TURTLE_ADDONS=ON \
+        -DENABLE_SOAP=OFF \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_FLAGS=-fpch-preprocess \
+    && if [ "${EXTRACTORS_ONLY}" = "ON" ]; then \
+         cmake --build build -j"${BUILD_JOBS}" --target mapextractor vmapextractor vmap_assembler MoveMapGen \
+         && mkdir -p /opt/turtle/bin \
+         && find build -type f -executable \
+              \( -name mapextractor -o -name vmapextractor -o -name vmap_assembler -o -name MoveMapGen \) \
+              -exec cp -a '{}' /opt/turtle/bin/ ';'; \
+       else \
+         cmake --build build -j"${BUILD_JOBS}" \
+         && cmake --install build; \
+       fi \
+    && (ccache -s -v || ccache -s) \
+    && printf 'core=%s\ntortoisebots=%s\n' "${SOURCE_REF}" "${TB_REF}" > /opt/turtle/SOURCE_COMMIT \
+    && rm -rf build
+
+# Keep SQL needed for first-time DB init + AutoUpdate path.
+RUN mkdir -p /opt/turtle/sql \
+    && cp -a sql/create_databases.sql sql/base sql/database_updates /opt/turtle/sql/ \
+    && for d in modules/mod-playerbots/sql src/modules/PlayerBots/sql; do \
+         if [ -d "$d" ]; then \
+           mkdir -p /opt/turtle/sql/playerbots \
+           && cp -a "$d"/. /opt/turtle/sql/playerbots/; \
+         fi; \
+       done
+
+# -----------------------------------------------------------------------------
+# Runtime
+# -----------------------------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
+
+# OFF: init-db.sh then skips the Shyalya playerbots SQL, which this image does not ship.
+ARG BUILD_PLAYERBOTS=OFF
+ARG CMAKE_INSTALL_PREFIX=/opt/turtle
+ARG CPU_TARGET=x86-64-v2
+
+LABEL org.opencontainers.image.title="tortoise-docker" \
+      org.opencontainers.image.description="Turtle WoW / Tortoise server (realmd + mangosd)" \
+      org.opencontainers.image.source="https://github.com/tortoise-wow/tortoise-wow" \
+      org.opencontainers.image.licenses="AGPL-3.0" \
+      org.opencontainers.image.cpu.target="${CPU_TARGET}"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC \
+    TURTLE_HOME=/opt/turtle \
+    PLAYERBOTS_BUILT=${BUILD_PLAYERBOTS} \
+    PATH=/opt/turtle/bin:$PATH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libace-7.0.6 \
+        libboost-atomic1.74.0 \
+        libboost-chrono1.74.0 \
+        libboost-date-time1.74.0 \
+        libboost-filesystem1.74.0 \
+        libboost-iostreams1.74.0 \
+        libboost-program-options1.74.0 \
+        libboost-regex1.74.0 \
+        libboost-serialization1.74.0 \
+        libboost-system1.74.0 \
+        libboost-thread1.74.0 \
+        libmysqlclient21 \
+        libssl3 \
+        zlib1g \
+        libbz2-1.0 \
+        libreadline8 \
+        libncurses6 \
+        mariadb-client \
+        tini \
+        gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 turtle \
+    && useradd --uid 1000 --gid turtle --home-dir /opt/turtle --shell /usr/sbin/nologin turtle
+
+COPY --from=builder /opt/turtle /opt/turtle
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/init-db.sh /usr/local/bin/init-db.sh
+COPY docker/render-config.sh /usr/local/bin/render-config.sh
+COPY docker/repair-migrations.sh /usr/local/bin/repair-migrations.sh
+COPY docker/character-inventory-copy.sql /opt/turtle/sql/character-inventory-copy.sql
+
+RUN chmod +x /usr/local/bin/entrypoint.sh \
+              /usr/local/bin/init-db.sh \
+              /usr/local/bin/render-config.sh \
+              /usr/local/bin/repair-migrations.sh \
+    && mkdir -p /opt/turtle/data /opt/turtle/logs /opt/turtle/run /var/lib/turtle-init \
+    && chown -R turtle:turtle /opt/turtle /var/lib/turtle-init
+
+# The core AutoUpdater reads module SQL from the build-time source path (TW_SOURCE_MODULES_DIR =
+# /src/tortoise-wow/modules), which does not exist in this image. TortoiseBots installs its migrations
+# under /opt/turtle/modules/<name>/data/sql/{world,character}, so point the build-time path there.
+RUN mkdir -p /src/tortoise-wow && ln -s /opt/turtle/modules /src/tortoise-wow/modules
+
+WORKDIR /opt/turtle/bin
+
+EXPOSE 3724/tcp 8090/tcp
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+CMD ["mangosd"]

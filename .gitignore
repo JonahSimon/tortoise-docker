@@ -3,3 +3,7 @@ data/
 logs/
 *.log
 .DS_Store
+
+# local backups
+.env.bak-*
+*.bak-*

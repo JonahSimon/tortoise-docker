@@ -9,6 +9,16 @@ x-turtle-image: &turtle-image ${TURTLE_IMAGE:-ghcr.io/nescabir/tortoise-docker:$
 services:
   db:
     image: mariadb:11.8@sha256:d9f7eb2637296652f24b484afd5d246f759f49f5babcadc6a9e344c9acb75fbf
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    tmpfs:
+      - /tmp
+      - /var/run/mysqld
+    user: "999:999"  # mariadb image's mysql uid; the db-data volume is owned by it (1000 = permission denied)
+    mem_limit: 2g
+    cpus: 2.0
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
@@ -28,6 +38,15 @@ services:
 
   db-init:
     image: *turtle-image
+    # Hardening exception (2026-09-29): the image's entrypoint renders configs into /opt/turtle/etc
+    # and mangosd writes F2_travel.log etc. into /opt/turtle/bin on every start, then drops to the
+    # `turtle` user itself via gosu. So: no read_only, no user: (the server still runs non-root),
+    # and the caps gosu/chown/root-writes need. The 2026-09-03 pass broke all three services.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    mem_limit: 512m
+    cpus: 1.0
     depends_on:
       db:
         condition: service_healthy
@@ -53,6 +72,15 @@ services:
 
   realmd:
     image: *turtle-image
+    # Hardening exception (2026-09-29): the image's entrypoint renders configs into /opt/turtle/etc
+    # and mangosd writes F2_travel.log etc. into /opt/turtle/bin on every start, then drops to the
+    # `turtle` user itself via gosu. So: no read_only, no user: (the server still runs non-root),
+    # and the caps gosu/chown/root-writes need. The 2026-09-03 pass broke all three services.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, KILL]  # KILL: tini (root) must signal the gosu-dropped server, or `stop` kills it unsaved
+    mem_limit: 256m
+    cpus: 0.5
     depends_on:
       db-init:
         condition: service_completed_successfully
@@ -66,11 +94,27 @@ services:
       REALM_PORT: ${REALM_PORT:-3724}
       BIND_IP: "0.0.0.0"
     ports:
-      - "${GAME_BIND_IP:-127.0.0.1}:${REALM_PORT:-3724}:3724"
+      # Host-side port is 3725, NOT 3724 -- deliberately different from the container-side
+      # literal here. REALM_PORT above must stay 3724 to match that container-side literal
+      # (the entrypoint also writes REALM_PORT into realmd.conf's listen port). This host port
+      # is loopback-only backend plumbing now: wow-gatekeeper is what's externally exposed on
+      # the real 3724 (the WoW client hardcodes that, can't be redirected), and it proxies to
+      # THIS host port. 3725 avoids colliding with AzerothCore's authserver, which also wants
+      # host-loopback 3724 (network_mode: host, BindIP=127.0.0.1) -- see [[wow-gatekeeper]].
+      - "${GAME_BIND_IP:-127.0.0.1}:3725:3724"
     command: ["realmd"]
 
   mangosd:
     image: *turtle-image
+    # Hardening exception (2026-09-29): the image's entrypoint renders configs into /opt/turtle/etc
+    # and mangosd writes F2_travel.log etc. into /opt/turtle/bin on every start, then drops to the
+    # `turtle` user itself via gosu. So: no read_only, no user: (the server still runs non-root),
+    # and the caps gosu/chown/root-writes need. The 2026-09-03 pass broke all three services.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, KILL]  # KILL: tini (root) must signal the gosu-dropped server, or `stop` kills it unsaved
+    mem_limit: 10g  # TortoiseBots with 1000 bots ran 6.2-7.3 GiB on 2026-10-01 (Shyalya build: ~5.1); raised from 8g
+    cpus: 4.0
     depends_on:
       db-init:
         condition: service_completed_successfully
@@ -98,11 +142,46 @@ services:
       AI_PLAYERBOT_ENABLED: ${AI_PLAYERBOT_ENABLED:-1}
       AI_MIN_RANDOM_BOTS: ${AI_MIN_RANDOM_BOTS:-10}
       AI_MAX_RANDOM_BOTS: ${AI_MAX_RANDOM_BOTS:-10}
+      # Ported playerbot keys (bot-port branch). Unset = render-config.sh leaves the
+      # shipped default (off) alone, so this is a no-op on stock images.
+      AI_POPULATE_AROUND_PLAYERS: ${AI_POPULATE_AROUND_PLAYERS:-}
+      AI_TRAVEL_PARTIES: ${AI_TRAVEL_PARTIES:-}
+      AI_TRAVEL_PARTY_TEST_MODE: ${AI_TRAVEL_PARTY_TEST_MODE:-}
+      AI_TRAVEL_PARTY_MUSTER: ${AI_TRAVEL_PARTY_MUSTER:-}
+      AI_TRAVEL_PARTY_DEST: ${AI_TRAVEL_PARTY_DEST:-}
+      AI_TRAVEL_PARTY_LEVELS: ${AI_TRAVEL_PARTY_LEVELS:-}
+      AI_TRAVEL_PARTY_MOVE_MODE: ${AI_TRAVEL_PARTY_MOVE_MODE:-}
+      AI_TRAVEL_PARTY_LEADER_STRIP: ${AI_TRAVEL_PARTY_LEADER_STRIP:-}
+      AI_TRAVEL_PARTY_ARRIVE_Z: ${AI_TRAVEL_PARTY_ARRIVE_Z:-}
+      AI_TRAVEL_PARTY_LOW_LEVEL_MAX_ROUTE: ${AI_TRAVEL_PARTY_LOW_LEVEL_MAX_ROUTE:-}
+      AI_TRAVEL_PARTY_LOW_LEVEL_BAND: ${AI_TRAVEL_PARTY_LOW_LEVEL_BAND:-}
+      AI_TRAVEL_PARTY_REQUIRE_PLAYER_ZONE: ${AI_TRAVEL_PARTY_REQUIRE_PLAYER_ZONE:-}
+      AI_TRAVEL_PARTY_CLOSEST_TOWN_PCT: ${AI_TRAVEL_PARTY_CLOSEST_TOWN_PCT:-}
+      AI_TRAVEL_PARTY_RAID_PCT: ${AI_TRAVEL_PARTY_RAID_PCT:-}
+      AI_TRAVEL_PARTY_CROSS_MAP_PROBE: ${AI_TRAVEL_PARTY_CROSS_MAP_PROBE:-}
+      AI_TRAVEL_PARTY_USE_REGISTRY: ${AI_TRAVEL_PARTY_USE_REGISTRY:-}
+      AI_TRAVEL_PARTY_MAX_CONCURRENT: ${AI_TRAVEL_PARTY_MAX_CONCURRENT:-}
+      AI_TRAVEL_PARTY_MAX_DEATHS: ${AI_TRAVEL_PARTY_MAX_DEATHS:-}
+      AI_TRAVEL_PARTY_ENTER_INSTANCE: ${AI_TRAVEL_PARTY_ENTER_INSTANCE:-}
+      AI_TRAVEL_PARTY_SPAWN_INTERVAL: ${AI_TRAVEL_PARTY_SPAWN_INTERVAL:-}
+      AI_POPULATE_DENSITY_DEFAULT: ${AI_POPULATE_DENSITY_DEFAULT:-}
+      AI_POPULATE_DENSITY_OVERRIDES: ${AI_POPULATE_DENSITY_OVERRIDES:-}
+      AI_POPULATE_PROB_TELEPORT: ${AI_POPULATE_PROB_TELEPORT:-}
+      AI_POPULATE_PEER_ANY_LEVEL_POINTS: ${AI_POPULATE_PEER_ANY_LEVEL_POINTS:-}
+      AI_RANDOM_BOT_FORCE_PVP: ${AI_RANDOM_BOT_FORCE_PVP:-}
+      AI_WORLD_PVP_SEEK: ${AI_WORLD_PVP_SEEK:-}
+      AI_WORLD_PVP_SEEK_BOT_PERCENT: ${AI_WORLD_PVP_SEEK_BOT_PERCENT:-}
+      GAME_TYPE: ${GAME_TYPE:-}
     ports:
       - "${GAME_BIND_IP:-127.0.0.1}:${WORLD_PORT:-8090}:8090"
     volumes:
       - ${DATA_PATH:-./data}:/opt/turtle/data:ro
       - mangosd-logs:/opt/turtle/logs
+      # The image bakes render-config.sh in at build time, so local edits to it are invisible
+      # until the next rebuild. Bind-mount the working copy over it. Needs +x on the host.
+      - ./docker/render-config.sh:/usr/local/bin/render-config.sh:ro
+      # Pinned conf values, applied last by render-config.sh (see conf-overrides/).
+      - ./conf-overrides:/opt/turtle/conf-overrides:ro
     command: ["mangosd"]
     # First start builds bot caches / travel data and can take a long time.
     stop_grace_period: 2m

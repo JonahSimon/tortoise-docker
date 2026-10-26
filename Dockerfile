@@ -24,6 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        ccache \
         cmake \
         git \
         libace-dev \
@@ -37,7 +38,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 
-RUN git clone --depth 1 --branch "${SOURCE_REF}" "${SOURCE_REPO}" tortoise-wow
+# CACHEBUST forces a fresh clone on demand (pass --build-arg CACHEBUST=$(date +%s)) without
+# needing `docker build --no-cache`, which would also wipe the ccache mount below - the two
+# problems (stale git checkout vs. slow full recompiles) need separate cache-invalidation
+# knobs, not the same sledgehammer.
+ARG CACHEBUST=1
+# --recurse-submodules: Shyalya's final tree (2026-09) builds Eluna from a submodule at src/modules/Eluna.
+RUN git clone --depth 1 --recurse-submodules --shallow-submodules --branch "${SOURCE_REF}" "${SOURCE_REPO}" tortoise-wow
 
 WORKDIR /src/tortoise-wow
 
@@ -54,12 +61,30 @@ RUN if grep -q -- '-march=native' CMakeLists.txt; then \
          exit 1; \
        fi
 
-RUN cmake -B build \
+# CCACHE_DIR is a BuildKit cache mount: it survives `docker build --no-cache`, which only
+# busts the layer cache (needed to actually pick up new commits from a moving branch) and
+# says nothing about ccache's own content-hash cache. Rebuilding after a small source change
+# should only recompile the translation units that actually changed.
+# CCACHE_SLOPPINESS: this tree builds with precompiled headers (src/modules/PlayerBots
+# botpch.h, core pchdef.h). Without pch_defines+time_macros ccache refuses to cache any
+# PCH-using compile - the first real build measured 139 cacheable vs 1016 UNCACHEABLE
+# objects, i.e. the cache was near-useless. Measured again by the `ccache -s -v` below.
+ENV CCACHE_DIR=/ccache \
+    CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime
+# -DENABLE_SOAP=OFF: Shyalya's final tree vendors a prebuilt libgsoap++.a linked against glibc 2.38+, and
+# this image is 22.04 (glibc 2.35), so it cannot link. We do not use SOAP (the console is the FIFO).
+# Older source trees ignore the flag.
+RUN --mount=type=cache,target=/ccache \
+    cmake -B build \
         -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
         -DCMAKE_INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}" \
         -DBUILD_PLAYERBOTS="${BUILD_PLAYERBOTS}" \
         -DUSE_EXTRACTORS="${USE_EXTRACTORS}" \
         -DALLOW_TURTLE_ADDONS=ON \
+        -DENABLE_SOAP=OFF \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_FLAGS=-fpch-preprocess \
     && if [ "${EXTRACTORS_ONLY}" = "ON" ]; then \
          cmake --build build -j"${BUILD_JOBS}" --target mapextractor vmapextractor vmap_assembler MoveMapGen \
          && mkdir -p /opt/turtle/bin \
@@ -70,16 +95,19 @@ RUN cmake -B build \
          cmake --build build -j"${BUILD_JOBS}" \
          && cmake --install build; \
        fi \
+    && (ccache -s -v || ccache -s) \
     && git rev-parse HEAD > /opt/turtle/SOURCE_COMMIT \
     && rm -rf build
 
 # Keep SQL needed for first-time DB init + AutoUpdate path.
 RUN mkdir -p /opt/turtle/sql \
     && cp -a sql/create_databases.sql sql/base sql/database_updates /opt/turtle/sql/ \
-    && if [ -d src/modules/PlayerBots/sql ]; then \
-         mkdir -p /opt/turtle/sql/playerbots \
-         && cp -a src/modules/PlayerBots/sql/. /opt/turtle/sql/playerbots/; \
-       fi
+    && for d in modules/mod-playerbots/sql src/modules/PlayerBots/sql; do \
+         if [ -d "$d" ]; then \
+           mkdir -p /opt/turtle/sql/playerbots \
+           && cp -a "$d"/. /opt/turtle/sql/playerbots/; \
+         fi; \
+       done
 
 # -----------------------------------------------------------------------------
 # Runtime
