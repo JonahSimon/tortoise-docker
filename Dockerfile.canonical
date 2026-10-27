@@ -49,9 +49,9 @@ ARG CACHEBUST=1
 # Source pins sit here, below apt-get: an ARG declared earlier is part of every later RUN's
 # cache key, so each new pin re-ran the apt layer.
 ARG SOURCE_REPO=https://github.com/tortoise-wow/tortoise-wow.git
-ARG SOURCE_REF=d94947b0db60c33e7248523ad0ba7f58af97fd09
+ARG SOURCE_REF=4a9b6d564b685aaf63eb056f1f0e6d6adc9e46b4
 ARG TB_REPO=https://github.com/JonahSimon/TortoiseBots.git
-ARG TB_REF=5b8959c0f86ef06085016c84dc24b5e9aa30309a
+ARG TB_REF=3b4c4c85a98d3541dd8103976a7928a4207bea19
 # Shallow fetch of an exact commit (git clone --branch cannot take a sha).
 RUN git init -q tortoise-wow \
     && git -C tortoise-wow fetch -q --depth 1 "${SOURCE_REPO}" "${SOURCE_REF}" \
